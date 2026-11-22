@@ -8,8 +8,8 @@ self_dit:
   heads: 12
   patch_size: 2
   text_dim: 512
-  max_t: 64      # 最长支持 64 tokens × (patch_size²) ≈ 32 秒 @ 12fps
-  max_h: 64      # H ≤ 64×patch_size = 128px；推理时会按此缩放
+  max_t: 64      # 单次推理最大帧数（chunked sampling；30s@12fps 分 ~5 次推理拼接）
+  max_h: 64      # latent 空间空间 token 上限（H/p ≤ 64 → 原图最大 ~512px；高分辨率需增大此值）
   max_w: 64
   mlp_ratio: 4.0
 

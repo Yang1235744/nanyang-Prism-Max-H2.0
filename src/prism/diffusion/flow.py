@@ -142,31 +142,39 @@ class EDCISampler:
                      seed=None, cfg_scale=3.5):
         """采样一段视频。返回 (latent_z, frames_tensor[B,C,T,H,W])。"""
         device = next(dit.parameters()).device
-        T_frames = min(int(duration * fps), dit.pos_t.shape[0])
-        H, W = height - (height % p), width - (width % p)
         p = dit.p
+        T_total = int(duration * fps)
+        max_chunk = min(dit.pos_t.shape[0], 64)  # 单次最大 chunk 帧数
 
-        if seed is not None:
-            torch.manual_seed(seed)
-
-        ctx_p, ctx_n, mask_p, mask_n = self._make_context(dit, text_enc, prompt, batch_size=T_frames)
+        ctx_p, ctx_n, mask_p, mask_n = self._make_context(dit, text_enc, prompt, batch_size=T_total)
         ts = self._timesteps(device)[: self.num_steps + 1]
 
-        h_tok, w_tok = H // p, W // p
-        z = torch.randn(T_frames, dit.patch_in.in_features // (p ** 2), 1, h_tok, w_tok, device=device)
-        z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).unsqueeze(0).expand(1, -1, T_frames, -1, -1)
+        h_tok, w_tok = height // p, width // p
 
-        for i in range(self.num_steps):
-            t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
-            t_in = t_cur.expand(T_frames)
-            v_full = dit(z, t_in,
-                         torch.cat([ctx_p, ctx_n], dim=0),
-                         torch.cat([mask_p, mask_n], dim=0))
-            v_ctx, v_uncond = v_full.chunk(2, dim=0)
-            v_pred = v_uncond + cfg_scale * (v_ctx - v_uncond)
-            delta_t = t_next - t_cur
-            z = z + v_pred * delta_t.unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        chunks_latent, chunks_frame = [], []
+        for start in range(0, T_total, max_chunk):
+            end = min(start + max_chunk, T_total)
+            chunk_len = end - start
 
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
-            frames = vae.decode(z.float())
-        return z.float(), frames.clamp(-1.0, 1.0)
+            z = torch.randn(chunk_len, dit.patch_in.in_features // (p ** 2), 1, h_tok, w_tok, device=device)
+            z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).unsqueeze(0).expand(1, -1, chunk_len, -1, -1)
+
+            for i in range(self.num_steps):
+                t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
+                t_in = t_cur.expand(chunk_len)
+                v_full = dit(z, t_in,
+                             torch.cat([ctx_p[start:end], ctx_n], dim=0),
+                             torch.cat([mask_p[start:end], mask_n], dim=0))
+                v_ctx, v_uncond = v_full.chunk(2, dim=0)
+                v_pred = v_uncond + cfg_scale * (v_ctx - v_uncond)
+                delta_t = t_next - t_cur
+                z = z + v_pred * delta_t.unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
+                frames = vae.decode(z.float())
+            chunks_latent.append(z)
+            chunks_frame.append(frames)
+
+        full_z = torch.cat(chunks_latent, dim=2)
+        full_frames = torch.cat(chunks_frame, dim=2)
+        return full_z, full_frames.clamp(-1.0, 1.0)
