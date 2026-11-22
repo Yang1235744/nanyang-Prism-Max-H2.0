@@ -1,0 +1,9 @@
+torch>=2.1.0
+numpy>=1.24
+Pillow>=10.0
+imageio[ffmpeg]>=2.34
+tqdm
+safetensors
+omegaconf>=2.3
+wandb           # 可选，实验可视化
+accelerate>=0.30
