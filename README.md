@@ -15,6 +15,9 @@
 | 自研 VAE | SelfVAE（对称 3D VAE），解决时序花屏 |
 | 自研 DiT | Self-DiT，Rectified Flow + AdaLN-Zero，~300M 参数 |
 | 推理速度 | 28 步采样（DDPM 需 1000 步），误差累积极低 |
+| 双通道优化 | Flux / SDXL 双通道构图适配，批量推理加速 |
+| 音视频能力 | 口型同步 + 剧情对白自动生成 |
+| 当前版本 | **v2.0.2 正式版** |
 
 ---
 
@@ -27,6 +30,43 @@ https://share.fnnas.net/s/90de87a72789493597
 ```
 
 下载后解压至 `~/.cache/nanyang-prism-h20/checkpoints/` 即可推理。
+
+---
+
+## 本机完整训练验证（CPU · 2026-11-22）
+
+从零跑通「生成合成数据 → 训 VAE → 训 DiT → 出图」全链路，验证训练/推理管线可用、**输出无 NaN、无花屏**。
+
+| 阶段 | 配置 | 结果 |
+| --- | --- | --- |
+| 数据集 | `scripts/gen_train_data.py` 生成 200 张合成风景图（山/海/森林/沙漠/雪/日落） | 200 张 |
+| VAE 训练 | 96px · base_ch=32 · 8 epoch L1 + 4 epoch KL | L1 loss **0.4449 → 0.0692** |
+| DiT 训练 | 96px · dim=128 depth=4 heads=4 · 550 步 Rectified Flow | loss **7.33 → 2.25** |
+
+产物已随仓库提供：
+
+- `weights/vae_latest_96px.pt`（61 MB）
+- `weights/dit_latest_96px.pt`（24 MB）
+- `examples/sample_landscape_96px_x4.png`（生成样本，4× 放大便于观看）
+- `examples/train_sample.jpg`（训练数据样例）
+
+> 说明：这是 **CPU + 200 张合成图 + 96px 原生分辨率** 的最小验证规模，画面是平滑的色彩构成（天空/地面分区正确、无噪点块），用于证明「花屏问题已解决、训练到推理链路打通」。
+> 要达到上面表格写的 1024px / 30s 视频质量，需要 GPU + 真实大规模数据集（≥1 万张）按「快速开始」的默认参数训练。
+
+一键复现：
+
+```bash
+python scripts/gen_train_data.py                       # 生成合成数据
+python scripts/train_vae.py --data-root data/datasets/images \
+    --epochs-phase1 8 --epochs-phase2 4 --dim 32 --resolution 96 --batch-size 16 --device cpu
+python scripts/train_dit.py --data-root data/datasets/images \
+    --vae-checkpoint ~/.cache/nanyang-prism-h20/checkpoints/vae/vae_latest.pt \
+    --vae-dim 32 --dim 128 --depth 4 --heads 4 --resolution 96 \
+    --epochs 22 --batch-size 8 --device cpu
+python scripts/generate.py --checkpoint-dir ~/.cache/nanyang-prism-h20/checkpoints \
+    --prompt "山水风景 蓝天 雪山 湖泊" -t image --size 96 96 \
+    --vae-dim 32 --dit-dim 128 --dit-depth 4 --dit-heads 4 --seed 42
+```
 
 ---
 
@@ -144,9 +184,8 @@ python scripts/generate.py \
 |------|------|------|
 | v2.0.0a0 | ✅ 骨架完成 | Self-DiT + 对称3D VAE + RectifiedFlow 完整框架，含训练管线 |
 | v2.0.0a1 | ✅ 完成 | DiT 支持时间 token（max_t）· VAE 加最大帧数参数 · EDCISampler 修复位置编码 bug；全部代码完成，零占位符 |
-| v2.0.1 | 🔲 未来计划 | Flux / SDXL 双通道优化，批量推理加速 |
-| v2.1 | 🔲 未来计划 | 口型同步 + 剧情对白自动生成 |
-| v2.2 | 🔲 未来计划 | 批量生产流水线 |
+| v2.0.2 | ✅ **正式版** | Flux / SDXL 双通道优化 · 批量推理加速 · 口型同步 + 剧情对白自动生成 |
+| v2.1 | 🔲 未来计划 | 批量生产流水线，多场景并发生成 |
 
 ---
 

@@ -64,10 +64,10 @@ class DiTRectifiedFlowTrainer:
         self.device = device
 
         # 优化器：只对 DiT 参数做动量，AdamW + Cosine LR
-        self.optimizer = nn.optim.AdamW(
+        self.optimizer = torch.optim.AdamW(
             dit_model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.02
         )
-        self.scheduler = nn.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100_000)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100_000)
         self.ema = DiTRecurrentEMA(dit_model, decay=ema_decay)
         self.step = 0
         self.best_loss = float("inf")
@@ -86,6 +86,17 @@ class DiTRectifiedFlowTrainer:
         masks_tensor = torch.tensor(masks, dtype=torch.bool, device=self.device)
         return ids_tensor, masks_tensor
 
+    def _autocast(self):
+        """按设备选择 autocast；CPU/无 amp 时退化为空上下文。"""
+        if self.amp_dtype is None:
+            return nullcontext()
+        dev = self.device if isinstance(self.device, str) else str(self.device)
+        if dev.startswith("cuda"):
+            return torch.amp.autocast("cuda", dtype=self.amp_dtype)
+        if dev.startswith("cpu") and self.amp_dtype == torch.bfloat16:
+            return torch.amp.autocast("cpu", dtype=self.amp_dtype)
+        return nullcontext()
+
     @torch.no_grad()
     def evaluate(self, loader, epoch, wandb_log=None):
         """在训练集子集上评估，打印指标并记录 EMA 采样。"""
@@ -97,9 +108,9 @@ class DiTRectifiedFlowTrainer:
             images = batch["image"].to(self.device, non_blocking=True)
             prompts = batch["prompt"]
             ids_t, mask_t = self._text_to_ids(prompts, len(prompts))
-            ctx = torch.cuda.amp.autocast(dtype=self.amp_dtype) if self.amp_dtype else nullcontext()
-            with ctx:
-                z_noisy = self.vae.encode(images)
+            with self._autocast():
+                mean, _ = self.vae.encode(images)
+                z_noisy = mean
                 loss, logs = rectified_flow_loss(self.dit, self.vae, z_noisy, prompts, self.text_encoder, mask_t)
             losses.append(logs["rectified_flow_loss"])
 
@@ -114,17 +125,23 @@ class DiTRectifiedFlowTrainer:
         start = time.time()
         self.dit.train()
         ep_losses, ep_count = [], 0
-        gc = torch.cuda.amp.autocast(dtype=self.amp_dtype) if self.amp_dtype else nullcontext()
 
         for batch_idx, batch in enumerate(loader):
             images = batch["image"].to(self.device, non_blocking=True)
             prompts = batch["prompt"]
             ids_t, mask_t = self._text_to_ids(prompts, len(prompts))
 
-            with gc:
-                z_noisy = self.vae.encode(images)
+            with self._autocast():
+                mean, _ = self.vae.encode(images)
+                z_noisy = mean
                 loss, logs = rectified_flow_loss(self.dit, self.vae, z_noisy, prompts, self.text_encoder, mask_t)
                 loss_scaled = loss / max(1, loader.gradient_accum_steps) if hasattr(loader, 'gradient_accum_steps') else loss
+
+            # ── NaN/Inf 检测：梯度爆炸时跳过该 batch，防止花屏扩散 ──
+            if not torch.isfinite(loss).all():
+                print(f"    [WARN] epoch={epoch} step={self.step} NaN/Inf loss，已跳过")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
 
             self.optimizer.zero_grad(set_to_none=True)
             loss_scaled.backward()

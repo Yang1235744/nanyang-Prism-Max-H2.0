@@ -1,16 +1,17 @@
 """推理入口：从本地 checkpoint 使用自研 Self-DiT + Self-VAE 生成图像/视频。
 
 用法：
-    python scripts/generate.py --prompt "雪地里的红狐" -t image --size 1024 1024
-    python scripts/generate.py --prompt "海浪拍打礁石" -t video --duration 30 --fps 12
+    python scripts/generate.py --prompt "山水风景" -t image --size 128 128 \
+        --vae-dim 64 --dit-dim 256 --dit-depth 6 --dit-heads 8
 
-权重从 --checkpoint-dir 目录加载（默认 ~/.cache/nanyang-prism-h20/models/）。
+权重从 --checkpoint-dir 目录加载（默认 ~/.cache/nanyang-prism-h20/checkpoints/）。
 模型架构完全自研，无任何第三方模型依赖。
 """
 import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
@@ -20,30 +21,31 @@ from prism.models.text_embed import ByteTextEncoder
 from prism.diffusion.flow import EDCISampler
 
 
-def build_models(checkpoint_dir: Path, device: str):
-    """加载 SelfVAE + SelfDiT + ByteTextEncoder。"""
-    cache = checkpoint_dir / "models"
-    cache.mkdir(parents=True, exist_ok=True)
+def _load_state(path: Path):
+    ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+    return ckpt
 
-    # VAE
-    vae = SelfVAE(in_channels=3, latent_channels=4, base_ch=128)
-    vae_path = cache / "vae_latest.pt"
+
+def build_models(args, device: str):
+    """加载 SelfVAE + SelfDiT + ByteTextEncoder。"""
+    ckpt_dir = Path(args.checkpoint_dir)
+    vae_path = ckpt_dir / "vae_latest.pt"
+    dit_path = ckpt_dir / "dit_latest.pt"
     if not vae_path.exists():
         raise FileNotFoundError(f"未找到 VAE 权重: {vae_path}\n请先运行: python scripts/train_vae.py ...")
-    vae.load_state_dict(torch.load(vae_path, map_location="cpu"), strict=False)
-
-    # DiT
-    dit = SelfDiT(in_channels=4, dim=768, depth=16, heads=12, patch_size=2, max_t=64)
-    dit_path = cache / "dit_latest.pt"
     if not dit_path.exists():
         raise FileNotFoundError(f"未找到 DiT 权重: {dit_path}\n请先运行: python scripts/train_dit.py ...")
-    dit.load_state_dict(torch.load(dit_path, map_location="cpu"), strict=False)
 
-    # Text Encoder
+    vae = SelfVAE(in_channels=3, latent_channels=4, base_ch=args.vae_dim)
+    vae.load_state_dict(_load_state(vae_path), strict=True)
+
+    dit = SelfDiT(in_channels=4, dim=args.dit_dim, depth=args.dit_depth,
+                  heads=args.dit_heads, patch_size=2, max_t=64)
+    dit.load_state_dict(_load_state(dit_path), strict=True)
+
     text_enc = ByteTextEncoder(dim=512, depth=4, heads=4)
-    te_path = cache / "text_encoder.pt"
-    if te_path.exists():
-        text_enc.load_state_dict(torch.load(te_path, map_location="cpu"), strict=False)
 
     vae = vae.to(device).eval()
     dit = dit.to(device).eval()
@@ -55,22 +57,23 @@ def build_models(checkpoint_dir: Path, device: str):
 @torch.no_grad()
 def generate_image(args):
     device = args.device
-    vae, dit, text_enc = build_models(args.checkpoint_dir, device)
+    vae, dit, text_enc = build_models(args, device)
     sampler = EDCISampler(num_steps=args.steps)
 
     _, img = sampler.sample_image(
         dit, vae, text_enc,
         prompt=args.prompt,
-        size=args.size,
+        size=tuple(args.size),
         seed=args.seed,
         cfg_scale=args.cfg_scale,
     )
-    out = (img + 1.0) * 0.5  # [-1,1] -> [0,1]
-    out_path = args.out or (Path.home() / ".cache/nanyang-prism-h20/images" / f"{args.seed or 0}.png")
+    out = (img + 1.0) * 0.5
+    out_path = Path(args.out) if args.out else (
+        Path.home() / ".cache/nanyang-prism-h20/images" / f"{args.seed or 0}.png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     from PIL import Image
-    arr = (out[0].mul(255).add_(0.5).clamp_(0, 255).to(torch.uint8)
-           .permute(1, 2, 0).numpy())
+    arr = (out[0, :, 0].mul(255).add_(0.5).clamp_(0, 255).to(torch.uint8)
+           .permute(1, 2, 0).cpu().numpy())  # [C,T,H,W] -> T=0 -> [H,W,C]
     Image.fromarray(arr).save(out_path)
     print(f"[Prism H2.0] 图片已保存: {out_path.resolve()}")
 
@@ -78,7 +81,7 @@ def generate_image(args):
 @torch.no_grad()
 def generate_video(args):
     device = args.device
-    vae, dit, text_enc = build_models(args.checkpoint_dir, device)
+    vae, dit, text_enc = build_models(args, device)
     sampler = EDCISampler(num_steps=args.steps)
 
     _, frames = sampler.sample_video(
@@ -91,18 +94,19 @@ def generate_video(args):
         seed=args.seed,
         cfg_scale=args.cfg_scale,
     )
-    out_path = args.out or (Path.home() / ".cache/nanyang-prism-h20/videos" / f"{args.seed or 0}.mp4")
+    out_path = Path(args.out) if args.out else (
+        Path.home() / ".cache/nanyang-prism-h20/videos" / f"{args.seed or 0}.mp4")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import imageio
-    videos_list = ((frames[0].mul(255).add_(0.5).clamp_(0, 255).to(torch.uint8)
-                     .permute(1, 2, 3, 0)).numpy()).tolist()
-    imageio.mimsave(str(out_path), videos_list, fps=args.fps, codec="libx264")
+    video = ((frames[0].mul(255).add_(0.5).clamp_(0, 255).to(torch.uint8)
+              .permute(1, 2, 3, 0)).cpu().numpy())
+    imageio.mimsave(str(out_path), list(video), fps=args.fps, codec="libx264")
     print(f"[Prism H2.0] 视频（{args.duration}秒）已保存: {out_path.resolve()}")
 
 
 def main():
     p = argparse.ArgumentParser(description="nanyang-Prism-Max-H2.0 自研生成器")
-    p.add_argument("--checkpoint-dir", default=str(Path.home() / ".cache/nanyang-prism-h20"))
+    p.add_argument("--checkpoint-dir", default=str(Path.home() / ".cache/nanyang-prism-h20/checkpoints"))
     p.add_argument("--prompt", required=True)
     p.add_argument("-t", "--type", dest="output_type", default="image", choices=["image", "video"])
     p.add_argument("--size", type=int, nargs=2, default=[1024, 1024], metavar=("W", "H"))
@@ -113,6 +117,11 @@ def main():
     p.add_argument("--fps", type=int, default=12)
     p.add_argument("-o", "--out", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # 模型规格（必须与训练时一致）
+    p.add_argument("--vae-dim", type=int, default=128)
+    p.add_argument("--dit-dim", type=int, default=768)
+    p.add_argument("--dit-depth", type=int, default=16)
+    p.add_argument("--dit-heads", type=int, default=12)
     args = p.parse_args()
 
     if args.output_type == "image":

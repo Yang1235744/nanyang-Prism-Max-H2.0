@@ -115,15 +115,15 @@ class EDCISampler:
         ctx_p, ctx_n, mask_p, mask_n = self._make_context(dit, text_enc, prompt)
         ts = self._timesteps(device)[: self.num_steps + 1]
 
-        # 初始化：全噪声
-        h_tok, w_tok = H // p, W // p
-        z = torch.randn(1, dit.patch_in.in_features // (p ** 2), T, h_tok, w_tok, device=device)
-        z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).expand(-1, vae.latent_channels, -1, -1, -1)
+        # 初始化：全噪声。VAE 空间下采样 8x，故 latent 尺寸为 H/8 × W/8
+        lat_h, lat_w = H // 8, W // 8
+        z = torch.randn(1, vae.latent_channels, T, lat_h, lat_w, device=device)
+        z = ts[0] * z
 
         for i in range(self.num_steps):
             t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
-            t_in = t_cur.expand(1)
-            # CFG: z 需要重复两份与拼合后的 context 对齐（B=2）
+            # CFG: z 与 t 都扩成 B=2，与拼接后的 context 对齐
+            t_in = t_cur.expand(2)
             z_cat = z.expand(2, -1, -1, -1, -1)
             v_full = dit(z_cat, t_in,
                          torch.cat([ctx_p, ctx_n], dim=0),
@@ -135,9 +135,8 @@ class EDCISampler:
             # 数值安全：防止随机初始化下放大 NaN/Inf
             z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # 解码到 RGB
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
-            img = vae.decode(z.float())
+        # 解码到 RGB（CPU 上 float32 无需 autocast）
+        img = vae.decode(z.float())
         return z.float(), img.clamp(-1.0, 1.0)
 
     @torch.no_grad()
@@ -153,15 +152,15 @@ class EDCISampler:
         ctx_p, ctx_n, mask_p, mask_n = self._make_context(dit, text_enc, prompt, batch_size=T_total)
         ts = self._timesteps(device)[: self.num_steps + 1]
 
-        h_tok, w_tok = height // p, width // p
+        h_tok, w_tok = height // 8, width // 8  # VAE 空间下采样 8x
 
         chunks_latent, chunks_frame = [], []
         for start in range(0, T_total, max_chunk):
             end = min(start + max_chunk, T_total)
             chunk_len = end - start
 
-            z = torch.randn(1, dit.patch_in.in_features // (p ** 2), chunk_len, h_tok, w_tok, device=device)
-            z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).expand(-1, vae.latent_channels, -1, -1, -1)
+            z = torch.randn(1, vae.latent_channels, chunk_len, h_tok, w_tok, device=device)
+            z = ts[0] * z
 
             for i in range(self.num_steps):
                 t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
@@ -178,8 +177,7 @@ class EDCISampler:
                 # 数值安全：防止随机初始化下放大 NaN/Inf
                 z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
 
-            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
-                frames = vae.decode(z.float())
+            frames = vae.decode(z.float())
             chunks_latent.append(z)
             chunks_frame.append(frames)
 

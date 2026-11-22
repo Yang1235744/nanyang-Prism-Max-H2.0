@@ -14,6 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
@@ -38,12 +39,12 @@ class SimplePromptDataset(ImageFolder):
         image = self.loader(img_path)
         if self.transform is not None:
             image = self.transform(image)
-        return {"image": image, "prompt": self._prompts[idx]}
+        return {"image": image.unsqueeze(1), "prompt": self._prompts[idx]}  # [C,1,H,W]
 
 
-def make_dataloader(root: Path, batch_size: int, num_workers: int = 4) -> DataLoader:
+def make_dataloader(root: Path, batch_size: int, num_workers: int = 4, resolution: int = 256) -> DataLoader:
     transform = v2.Compose([
-        v2.Resize(256),
+        v2.Resize((resolution, resolution)),
         v2.RandomHorizontalFlip(),
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
@@ -51,7 +52,7 @@ def make_dataloader(root: Path, batch_size: int, num_workers: int = 4) -> DataLo
     ])
     ds = SimplePromptDataset(str(root), transform)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                    pin_memory=True, drop_last=True)
+                    pin_memory=False, drop_last=True)
     return dl
 
 
@@ -76,19 +77,21 @@ def main():
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--vae-dim", type=int, default=128, help="必须与训练 VAE 时的 --dim 一致")
+    parser.add_argument("--resolution", type=int, default=256)
     args = parser.parse_args()
 
     device = args.device
     ckpt_dir = args.ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[Info] 数据集: {args.data_root}")
-    loader = make_dataloader(args.data_root, args.batch_size, args.num_workers)
+    print(f"[Info] 数据集: {args.data_root} 分辨率={args.resolution}")
+    loader = make_dataloader(args.data_root, args.batch_size, args.num_workers, args.resolution)
     loader.gradient_accum_steps = args.grad_accum  # 传给 trainer
 
     # 加载并冻结 VAE
-    print(f"[Info] 加载冻结 VAE: {args.vae_checkpoint}")
-    vae = SelfVAE(in_channels=3, latent_channels=4, base_ch=128)
+    print(f"[Info] 加载冻结 VAE: {args.vae_checkpoint} (dim={args.vae_dim})")
+    vae = SelfVAE(in_channels=3, latent_channels=4, base_ch=args.vae_dim)
     ckpt = torch.load(args.vae_checkpoint, map_location="cpu")
     # 兼容 .pt 和 .safetensors 格式
     state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
@@ -103,7 +106,8 @@ def main():
     dit = SelfDiT(in_channels=4, dim=args.dim, depth=args.depth,
                   heads=args.heads, patch_size=2, max_t=args.max_t)
     trainer = DiTRectifiedFlowTrainer(dit, vae, text_enc, lr=args.lr,
-                                       grad_clip=1.0, amp_dtype=torch.bfloat16,
+                                       grad_clip=1.0,
+                                       amp_dtype=torch.bfloat16 if str(device).startswith("cuda") else None,
                                        device=device)
 
     if args.resume:
