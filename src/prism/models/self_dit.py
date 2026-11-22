@@ -96,14 +96,28 @@ class CrossAttention(nn.Module):
         self.kv = nn.Linear(dim, dim * 2)
         self.proj = nn.Linear(dim, dim)
 
+    @staticmethod
+    def _safe_tensor(x: torch.Tensor) -> torch.Tensor:
+        """防止 NaN/Inf 传播——对极端值做 clipping，保证 softmax 稳定。"""
+        x = x.to(torch.float32)
+        return torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
     def forward(self, x, ctx, ctx_mask=None):
         B, N, D = x.shape
         L = ctx.shape[1]
-        q = self.q(self.norm(x)).reshape(B, N, self.heads, D // self.heads).transpose(1, 2)
+        q = self.q(self.norm(x)).reshape(B, N, self.heads, D // self.heads).transpose(1, 2)   # [B,H,N,Dh]
         kv = self.kv(self.norm_ctx(ctx)).reshape(B, L, 2, self.heads, D // self.heads)
-        k, v = kv.unbind(2)
-        out = F.scaled_dot_product_attention(q, k.transpose(1, 2), v, attn_mask=ctx_mask)
-        out = out.transpose(1, 2).reshape(B, N, D)
+        k, v = kv.unbind(2)  # [B,L,H,Dh]
+        k = k.transpose(1, 2)  # [B,H,L,Dh]
+        v = v.transpose(1, 2)  # [B,H,L,Dh]
+
+        scale = (D // self.heads) ** -0.5
+        sim = q @ k.transpose(-2, -1) * scale              # [B,H,N,L]
+        if ctx_mask is not None:
+            mask = ctx_mask.float().unsqueeze(1).unsqueeze(2)  # [B,1,1,L]
+            sim = sim.masked_fill(mask.bool(), -1e9)
+        attn = torch.softmax(self._safe_tensor(sim), dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, D)  # [B,N,D]
         return self.proj(out)
 
 
@@ -133,7 +147,7 @@ class DiTBlock(nn.Module):
         self.mod = AdaLNZero(dim)
 
     def forward(self, x, c, ctx, ctx_mask=None):
-        s1, c1, g1, s2, c2, g2, s3, c3, g3 = self.mod(c).chunk(9, dim=-1)
+        s1, c1, g1, s2, c2, g2, s3, c3, g3 = self.mod(c)
 
         # Self-attention
         h = modulate(x, s1, c1)

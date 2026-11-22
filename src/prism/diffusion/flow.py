@@ -93,8 +93,8 @@ class EDCISampler:
     def _make_context(self, dit, text_enc, prompt, batch_size=1):
         """构建文本上下文与 padding mask。"""
         from ..models.text_embed import encode_text, PAD_ID
-        ids_pos = torch.tensor([encode_text(prompt) for _ in range(batch_size)], device=dit.device)
-        ids_neg = torch.full((batch_size, 128), PAD_ID, device=dit.device)
+        ids_pos = torch.tensor([encode_text(prompt) for _ in range(batch_size)], device=next(dit.parameters()).device)
+        ids_neg = torch.full((batch_size, 128), PAD_ID, device=next(dit.parameters()).device)
         ctx_pos = text_enc(ids_pos)
         ctx_neg = text_enc(ids_neg)
         mask_pos = ids_pos == PAD_ID
@@ -123,13 +123,17 @@ class EDCISampler:
         for i in range(self.num_steps):
             t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
             t_in = t_cur.expand(1)
-            v_full = dit(z, t_in,
+            # CFG: z 需要重复两份与拼合后的 context 对齐（B=2）
+            z_cat = z.expand(2, -1, -1, -1, -1)
+            v_full = dit(z_cat, t_in,
                          torch.cat([ctx_p, ctx_n], dim=0),
                          torch.cat([mask_p, mask_n], dim=0))
             v_ctx, v_uncond = v_full.chunk(2, dim=0)
             v_pred = v_uncond + cfg_scale * (v_ctx - v_uncond)
             delta_t = t_next - t_cur
             z = z + v_pred * delta_t.unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            # 数值安全：防止随机初始化下放大 NaN/Inf
+            z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
 
         # 解码到 RGB
         with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
@@ -156,19 +160,23 @@ class EDCISampler:
             end = min(start + max_chunk, T_total)
             chunk_len = end - start
 
-            z = torch.randn(chunk_len, dit.patch_in.in_features // (p ** 2), 1, h_tok, w_tok, device=device)
-            z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).unsqueeze(0).expand(1, -1, chunk_len, -1, -1)
+            z = torch.randn(1, dit.patch_in.in_features // (p ** 2), chunk_len, h_tok, w_tok, device=device)
+            z = ((1.0 - ts[0]) * 0.0 + ts[0] * z).expand(-1, vae.latent_channels, -1, -1, -1)
 
             for i in range(self.num_steps):
                 t_cur, t_next = ts[i].view(1), ts[i + 1].view(1)
-                t_in = t_cur.expand(chunk_len)
-                v_full = dit(z, t_in,
-                             torch.cat([ctx_p[start:end], ctx_n], dim=0),
-                             torch.cat([mask_p[start:end], mask_n], dim=0))
+                # CFG: t 也需扩成 B=2，与 z_cat 对齐；否则 timestep_embedding 产出的 c 维度不匹配
+                t_in = t_cur.expand(2)
+                z_cat = z.expand(2, -1, -1, -1, -1)
+                v_full = dit(z_cat, t_in,
+                             torch.cat([ctx_p[:1], ctx_n[:1]], dim=0),
+                             torch.cat([mask_p[:1], mask_n[:1]], dim=0))
                 v_ctx, v_uncond = v_full.chunk(2, dim=0)
                 v_pred = v_uncond + cfg_scale * (v_ctx - v_uncond)
                 delta_t = t_next - t_cur
                 z = z + v_pred * delta_t.unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                # 数值安全：防止随机初始化下放大 NaN/Inf
+                z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
 
             with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float32):
                 frames = vae.decode(z.float())
