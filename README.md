@@ -17,19 +17,47 @@
 | 推理速度 | 28 步采样（DDPM 需 1000 步），误差累积极低 |
 | 双通道优化 | Flux / SDXL 双通道构图适配，批量推理加速 |
 | 音视频能力 | 口型同步 + 剧情对白自动生成 |
-| 当前版本 | **v2.0.2 正式版** |
+| 当前版本 | **v2.0.2-beta 公测版** |
 
 ---
 
 ## 直接下载（不自己训练）
 
-现成权重（SelfVAE + Self-DiT checkpoint）托管在自建 NAS，永久有效、无需注册：
+公测版权重**直接随本仓库提供**，无需网盘：
 
 ```
-https://share.fnnas.net/s/90de87a72789493597
+weights/vae_latest_96px.pt   # SelfVAE，61 MB
+weights/dit_latest_96px.pt   # Self-DiT，24 MB
 ```
 
-下载后解压至 `~/.cache/nanyang-prism-h20/checkpoints/` 即可推理。
+放到 `~/.cache/nanyang-prism-h20/checkpoints/` 后即可推理（CPU 可跑）：
+
+```bash
+python scripts/generate.py --checkpoint-dir ~/.cache/nanyang-prism-h20/checkpoints \
+    --prompt "山水风景 蓝天 雪山 湖泊" -t image --size 96 96 \
+    --vae-dim 32 --dit-dim 128 --dit-depth 4 --dit-heads 4 --seed 42
+```
+
+> ⚠️ 公测期限制：这组 96px 权重是为验证「训练→推理链路 + 无花屏」准备的最小规模模型，**只能出构图色块、没有细节**，属预期行为。
+> 1024×1024 正式权重（GPU 训练版）完成后单独发布。
+
+---
+
+## 公测（Beta）说明
+
+当前版本 **v2.0.2-beta**，面向公测，重点是收集真实使用反馈。已知限制：
+
+- 96px 验证权重画质有限（见上）
+- 1024px 高清与 30 秒视频需要 GPU 训练版权重
+- 训练脚本要求数据目录下存在子文件夹（`data/images/xxx.jpg`）
+- CPU 训练速度慢：96px / batch 16 约 0.9 分钟一轮
+
+反馈渠道（欢迎提 Bug、画质问题、想要的能力）：
+
+- 提交 Bug → https://github.com/Yang1235744/nanyang-Prism-Max-H2.0/issues/new?labels=bug
+- 提需求 → https://github.com/Yang1235744/nanyang-Prism-Max-H2.0/issues/new?labels=enhancement
+
+提 Bug 时请附上：prompt、seed、采样步数、`--size`、模型规格参数、报错日志/截图。
 
 ---
 
@@ -184,7 +212,7 @@ python scripts/generate.py \
 |------|------|------|
 | v2.0.0a0 | ✅ 骨架完成 | Self-DiT + 对称3D VAE + RectifiedFlow 完整框架，含训练管线 |
 | v2.0.0a1 | ✅ 完成 | DiT 支持时间 token（max_t）· VAE 加最大帧数参数 · EDCISampler 修复位置编码 bug；全部代码完成，零占位符 |
-| v2.0.2 | ✅ **正式版** | Flux / SDXL 双通道优化 · 批量推理加速 · 口型同步 + 剧情对白自动生成 |
+| v2.0.2-beta | ✅ **公测版** | Flux / SDXL 双通道优化 · 批量推理加速 · 口型同步 + 剧情对白自动生成 · 开放 Issue 反馈通道 |
 | v2.1 | 🔲 未来计划 | 批量生产流水线，多场景并发生成 |
 
 ---
